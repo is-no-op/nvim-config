@@ -1,0 +1,4 @@
+# Extra tools for nvim-local (the local-model variant). Installed by setup-local.sh via `brew bundle`,
+# in addition to the main Brewfile.
+
+brew "python@3.12"  # runs mlx-lm (the local model server); mlx-lm needs Python >= 3.11

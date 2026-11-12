@@ -1,0 +1,146 @@
+#!/bin/bash
+# nvim-local: Neovim with a local LLM (MLX) in the right-hand chat pane instead of Claude.
+# Installed by setup-local.sh as a symlink: ~/.local/bin/nvim-local -> <repo>/local-ai/bin/nvim-local
+#   Config:  ~/.config/nvim-local   (NVIM_APPNAME=nvim-local; links into the repo, see setup-local.sh)
+#   Server:  mlx_lm.server on 127.0.0.1:$NVIM_LOCAL_PORT, started on the first nvim-local launch,
+#            stopped when the last nvim-local exits. Models load on the first chat request and are
+#            swapped (old one freed) when you pick another model in the chat (ga).
+#   Logs:    ~/.local/state/nvim-local/server.log
+# bash 3.2 compatible.
+set -u
+
+PORT="${NVIM_LOCAL_PORT:-8484}"
+VENV="${NVIM_LOCAL_VENV:-$HOME/.local/share/mlx-lm/venv}"
+# Preloaded at start. Must match DEFAULT_MODEL in local-ai/config/lua/local_ai/codecompanion.lua
+# (the chat asks for that model, so preloading anything else would only cost a swap).
+DEFAULT_MODEL="mlx-community/Ministral-3-8B-Instruct-2512-4bit"
+# The server launcher sits next to this script in the repo (follow the ~/.local/bin symlink).
+self="$0"
+while [ -L "$self" ]; do
+  link="$(readlink "$self")"
+  case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+LAUNCHER="$(CDPATH='' cd -- "$(dirname -- "$self")/../server" 2>/dev/null && pwd -P)/nvim-local-server.py"
+case "${XDG_STATE_HOME:-/}" in
+/*) ;;
+*)
+  echo "nvim-local: XDG_STATE_HOME must be an absolute path (got '$XDG_STATE_HOME')." >&2
+  exit 1
+  ;;
+esac
+case "$PORT" in
+'' | *[!0-9]*)
+  echo "nvim-local: NVIM_LOCAL_PORT must be a number (got '$PORT')." >&2
+  exit 1
+  ;;
+esac
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nvim-local"
+# Per-port state, so instances using different NVIM_LOCAL_PORT values each manage their own server.
+CLIENTS="$STATE/clients-$PORT"
+PIDFILE="$STATE/server-$PORT.pid"
+LOCKDIR="$STATE/lock-$PORT"
+
+mkdir -p "$CLIENTS" || exit 1
+
+lock() {
+  local i=0
+  until mkdir "$LOCKDIR" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge 300 ]; then # ~30s (a holder may be waiting up to ~15s for the server to exit): assume it crashed
+      rm -rf "$LOCKDIR"
+      i=0
+    fi
+    sleep 0.1
+  done
+}
+unlock() { rmdir "$LOCKDIR" 2>/dev/null; }
+
+# Our server = the pid in PIDFILE, still alive, and still an mlx_lm.server (pids get reused).
+server_pid() {
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  ps -p "$pid" -o command= 2>/dev/null | grep -q "nvim-local-server.py" || return 1
+  echo "$pid"
+}
+
+port_in_use() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; }
+
+start_server() {
+  server_pid >/dev/null && return 0
+  # A server that is still shutting down (e.g. one we just stopped) can hold the port briefly.
+  local i=0
+  while port_in_use && [ "$i" -lt 50 ]; do
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if port_in_use; then
+    echo "nvim-local: port $PORT is in use by another program; not starting the model server." >&2
+    echo "            Set NVIM_LOCAL_PORT to use a different port." >&2
+    return 1
+  fi
+  if [ ! -x "$VENV/bin/python" ] || [ ! -f "$LAUNCHER" ]; then
+    echo "nvim-local: $VENV/bin/python or $LAUNCHER not found; chat will not work." >&2
+    return 1
+  fi
+  # HF_HUB_OFFLINE: only use already-downloaded models; never reach the network.
+  # --model: preload the default chat model in the background at launch, so the first question
+  # doesn't wait for a multi-GB load. Picking another model in the chat swaps it (old one freed).
+  # Started via nvim-local-server.py, which caps MLX's buffer cache so a swapped-out model's
+  # memory goes back to macOS (otherwise the server keeps holding it).
+  HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 nohup "$VENV/bin/python" -I "$LAUNCHER" \
+    --model "$DEFAULT_MODEL" \
+    --host 127.0.0.1 --port "$PORT" \
+    --max-tokens 8192 \
+    --chat-template-args '{"enable_thinking":false}' \
+    --prompt-cache-size 2 --prompt-cache-bytes 2GB \
+    >>"$STATE/server.log" 2>&1 </dev/null &
+  echo $! >"$PIDFILE"
+  disown $! 2>/dev/null # no "Terminated" job notice when we stop it later
+}
+
+prune_clients() {
+  local f
+  for f in "$CLIENTS"/*; do
+    [ -e "$f" ] || continue
+    kill -0 "${f##*/}" 2>/dev/null || rm -f "$f"
+  done
+}
+
+stop_server_if_unused() {
+  local pid
+  prune_clients
+  if [ -z "$(ls -A "$CLIENTS" 2>/dev/null)" ] && pid=$(server_pid); then
+    kill "$pid" 2>/dev/null
+    # Wait for it to exit (and free the port) so a window opened right after can start a new one.
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 75 ]; do
+      sleep 0.2
+      i=$((i + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+  fi
+}
+
+cleanup() {
+  trap - EXIT HUP INT TERM
+  rm -f "$CLIENTS/$$"
+  lock
+  stop_server_if_unused
+  unlock
+}
+
+lock
+prune_clients
+touch "$CLIENTS/$$"
+start_server
+unlock
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+export NVIM_LOCAL_PORT="$PORT"
+NVIM_APPNAME=nvim-local nvim "$@"
